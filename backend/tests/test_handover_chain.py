@@ -178,6 +178,31 @@ def test_failed_segment_does_not_roll_back_completed_segments(client):
     assert start(client, n=2, to=3).status_code == 200
 
 
+def test_complete_all_failure_keeps_committed_segments(client):
+    """一键办完路径：中段失败时，已提交前段过户同样禁止被撤销（路由层不得旁路回滚）。"""
+    plan = start(client, n=1).json()  # 4 段，每段 1 键
+    pid = plan["id"]
+    assert client.post(f"/api/handovers/{pid}/segments/1/complete").status_code == 200
+    assert owners(client)["B20261115-01"] == 2  # 第 1 段已过户提交
+    # 制造第 2 段失败：其键已不在交班方在途名下
+    with connect() as conn:
+        conn.execute("UPDATE batches SET status = '已结清' WHERE biz_key = 'B20261115-02'")
+        conn.commit()
+    r = client.post(f"/api/handovers/{pid}/complete")
+    assert r.status_code == 200, r.text
+    plan = r.json()
+    assert plan["status"] == "失败"
+    segs = {s["seq"]: s for s in plan["segments"]}
+    assert segs[1]["status"] == "已完成" and segs[2]["status"] == "失败"
+    assert segs[3]["status"] == "已阻断" and segs[4]["status"] == "已阻断"
+    # 关键：一键办完路径同样禁止撤销前段已提交过户
+    assert owners(client)["B20261115-01"] == 2
+    b2 = [b for b in client.get("/api/batches").json() if b["biz_key"] == "B20261115-02"][0]
+    assert (b2["owner_shift_id"], b2["status"]) == (1, "已结清")
+    assert owners(client)["B20261115-03"] == 1
+    assert owners(client)["B20261114-09"] == 1
+
+
 # ---------------------------------------------------------------- 计划级对账
 
 
@@ -205,3 +230,35 @@ def test_plan_success_requires_every_segment_and_complete_union(client):
     assert again["reconcile"]["plan_ok"] is True
     assert again["union_check"]["并集完整"] is True
     assert [s["status"] for s in again["segments"]] == ["已完成", "已完成"]
+
+
+def test_plan_proof_readonly_by_plan_id(client):
+    """按计划 id 查询并集证明（只读）：物化报告链 + 同源实时校验，字段齐全。"""
+    plan = start(client, n=2).json()  # 2 段：2 + 2
+    pid = plan["id"]
+    for seq in (1, 2):
+        assert client.post(f"/api/handovers/{pid}/segments/{seq}/complete").status_code == 200
+    r = client.get(f"/api/reconcile/{pid}")
+    assert r.status_code == 200, r.text
+    proof = r.json()
+    assert proof["plan_id"] == pid
+    # 物化报告链：发起切分校验 + 终态定案
+    assert [rep["stage"] for rep in proof["reports"]] == ["发起切分校验", "终态定案"]
+    final = proof["reports"][-1]
+    assert final["plan_ok"] is True and final["union_ok"] is True
+    d = final["detail"]
+    # 并集证明字段：发起快照、各段键集、并集、段间交集冲突
+    assert set(d["并集键"]) == set(d["快照键"]) == {"B20261115-01", "B20261115-02", "B20261115-03", "B20261114-09"}
+    assert [s["keys"] for s in d["段清单"]] == [
+        ["B20261115-01", "B20261115-02"],
+        ["B20261115-03", "B20261114-09"],
+    ]
+    assert d["缺失键"] == [] and d["多出键"] == [] and d["段间相交键"] == []
+    # 同源实时校验与物化结论一致
+    u = proof["union_check"]
+    assert u["计划成功"] is True and u["并集完整"] is True and u["段间互斥"] is True
+    assert set(u["快照键"]) == set(u["并集键"])
+    # 只读：查询不改动计划状态
+    assert client.get(f"/api/handovers/{pid}").json()["status"] == "已完成"
+    # 不存在的计划 → 404
+    assert client.get("/api/reconcile/9999").status_code == 404

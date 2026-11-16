@@ -31,29 +31,12 @@ def start(body: StartBody):
 
 @router.post("/{plan_id}/complete")
 def complete(plan_id: int):
-    """按序完成剩余全部段（每段独立事务提交，任一段失败即停）。"""
-    result = svc.complete_handover(plan_id)
-    if result.get("status") == "失败":
-        from app.db import connect
+    """按序完成剩余全部段（每段独立事务提交，任一段失败即停）。
 
-        with connect() as conn:
-            row = conn.execute(
-                "SELECT from_shift_id FROM handover_plans WHERE id = ?", (plan_id,)
-            ).fetchone()
-            if row:
-                conn.execute(
-                    """
-                    UPDATE batches SET owner_shift_id = ?
-                    WHERE id IN (
-                      SELECT hi.batch_id FROM handover_segment_items hi
-                      JOIN handover_segments s ON s.id = hi.segment_id
-                      WHERE s.plan_id = ? AND s.status = '已完成'
-                    )
-                    """,
-                    (row["from_shift_id"], plan_id),
-                )
-                conn.commit()
-    return result
+    失败隔离在服务层落实：已完成段的已提交过户保留不回滚；
+    路由层不得旁路撤销任何已提交过户。
+    """
+    return svc.complete_handover(plan_id)
 
 
 @router.post("/{plan_id}/segments/{seq}/complete")

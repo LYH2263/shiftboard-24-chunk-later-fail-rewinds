@@ -11,8 +11,10 @@ from app.db import connect, rows_to_dicts
 # 设计抉择（题目要求三处择一，均在此落实）：
 # 1) 计划-段关系：独立交班计划表 handover_plans + 段交班单 handover_segments
 #    外键挂 plan_id，并加 UNIQUE(plan_id, seq)；发起时一次性切出全部段。
-# 2) 失败隔离：段级独立事务提交。每段过户在自己的事务里提交；本段失败只回滚
-#    本段过户，已提交的前序段过户不回滚，后续段置「已阻断」，计划标失败。
+# 2) 失败隔离（二择一，已选定「段级独立事务」）：每段过户在自己的事务里提交，
+#    前段一旦提交即不可撤销——后段失败只回滚本段未提交的过户，已完成段的
+#    已提交过户保留、绝不回滚；后续段置「已阻断」，计划标失败。
+#    全代码库（服务层与路由层）禁止任何撤销已完成段过户的回滚钩/旁路。
 # 3) 并集校验物化：独立计划对账报告表 plan_reconcile_reports，发起切分时与
 #    计划终态各落一份；校验为真实集合并集对比快照，禁止用成功计数加总冒充。
 
@@ -217,6 +219,8 @@ def _collect_sets(conn, plan_id: int) -> dict:
 def _union_check(conn, plan_id: int) -> dict:
     c = _collect_sets(conn, plan_id)
     return {
+        "快照键": c["snap_keys"],
+        "并集键": c["union_keys"],
         "快照键数": len(c["snap_keys"]),
         "并集键数": len(c["union"]),
         "缺失键": c["missing"],
@@ -292,6 +296,30 @@ def list_reconcile() -> list[dict]:
             """
         ).fetchall()
         return [_report_to_dict(r) for r in rows]
+
+
+def get_plan_proof(plan_id: int) -> dict:
+    """计划级并集证明（只读，按计划 id 查询）。
+
+    返回物化落档的报告链（发起切分校验、终态定案）+ 同源实时校验；
+    两者都由 _collect_sets 的真实集合运算派生：发起快照、各段键集、
+    并集、段间交集冲突一应俱全，禁止用各段成功计数加总冒充并集。
+    """
+    with connect() as conn:
+        plan = conn.execute(
+            "SELECT id FROM handover_plans WHERE id = ?", (plan_id,)
+        ).fetchone()
+        if not plan:
+            raise HTTPException(404, "交班计划不存在")
+        reports = conn.execute(
+            "SELECT * FROM plan_reconcile_reports WHERE plan_id = ? ORDER BY id",
+            (plan_id,),
+        ).fetchall()
+        return {
+            "plan_id": plan_id,
+            "union_check": _union_check(conn, plan_id),
+            "reports": [_report_to_dict(r) for r in reports],
+        }
 
 
 # ---------------------------------------------------------------- 发起交班
@@ -421,22 +449,13 @@ def _do_complete_segment(plan_id: int, seq: int) -> dict:
             if cur.rowcount == 0:
                 failed_keys.append(it["biz_key"])
         if failed_keys:
-            # 段级独立事务：回滚本段过户；前序段已各自提交，不受牵连
+            # 段级独立事务：回滚本段未提交的过户；前序段已各自提交，不受牵连。
             conn.rollback()
             reason = f"段内键 {'、'.join(failed_keys)} 已不在交班方在途名下，本段过户整体回滚"
+            # 失败定案在新事务中落库。注意：此处绝不回写已完成段的批次归属——
+            # 前段过户已提交即不可撤销（段级独立事务，见文件头设计抉择 2）。
             conn.execute("BEGIN IMMEDIATE")
             now = _now()
-            conn.execute(
-                """
-                UPDATE batches SET owner_shift_id = ?
-                WHERE id IN (
-                  SELECT hi.batch_id FROM handover_segment_items hi
-                  JOIN handover_segments s ON s.id = hi.segment_id
-                  WHERE s.plan_id = ? AND s.seq < ? AND s.status = '已完成'
-                )
-                """,
-                (plan["from_shift_id"], plan_id, seq),
-            )
             conn.execute(
                 "UPDATE handover_segments SET status = '失败', reason = ?, finished_at = ? WHERE id = ?",
                 (reason, now, seg["id"]),

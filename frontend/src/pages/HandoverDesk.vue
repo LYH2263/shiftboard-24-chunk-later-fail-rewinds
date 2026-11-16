@@ -17,13 +17,17 @@ const nextSeq = computed(() => {
   return s ? s.seq : null
 })
 
-// 并集校验视图：终态后展示物化报告；进行中展示实时预览（发起切分校验已物化）
+// 并集校验视图：终态后展示物化报告；进行中展示实时预览（发起切分校验已物化）。
+// 两个分支同源派生（物化报告 detail 与实时 union_check 均出自同一集合校验），
+// 展示字段一致：发起快照、各段键集（段链条表）、并集、段间交集冲突。
 const checkView = computed(() => {
   if (!plan.value) return null
   const r = plan.value.reconcile
   if (r && r.stage === '终态定案') {
     return {
       source: `物化报告 #${r.id} · ${r.stage} · ${r.created_at}`,
+      快照键: r.detail.快照键,
+      并集键: r.detail.并集键,
       快照键数: r.snapshot_count,
       并集键数: r.union_count,
       缺失键: r.detail.缺失键,
@@ -199,6 +203,8 @@ function reportResult(label) {
         <span class="tag" :class="checkView.每段成功 ? 'on' : 'bad'">每段成功 {{ checkView.每段成功 ? '✓' : '✗' }}</span>
         <span class="tag" :class="checkView.计划成功 ? 'on' : 'bad'">计划成功 {{ checkView.计划成功 ? '✓' : '✗' }}</span>
       </p>
+      <p class="lead" style="margin-bottom:4px">发起快照：{{ checkView.快照键.join('、') }}</p>
+      <p class="lead" style="margin-bottom:12px">段清单并集：{{ checkView.并集键.join('、') || '—' }}</p>
       <p v-if="checkView.缺失键.length" class="msg">缺失键：{{ checkView.缺失键.join('、') }}</p>
       <p v-if="checkView.多出键.length" class="msg">多出键：{{ checkView.多出键.join('、') }}</p>
       <p v-if="checkView.段间相交键.length" class="msg">段间相交键：{{ checkView.段间相交键.join('、') }}</p>
